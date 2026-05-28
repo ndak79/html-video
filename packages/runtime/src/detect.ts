@@ -46,6 +46,20 @@ export async function detectOne(def: AgentDef): Promise<DetectedAgent> {
   };
 }
 
-export async function detectAll(): Promise<DetectedAgent[]> {
-  return Promise.all(AGENT_DEFS.map(detectOne));
+// In-process cache. Agent install state doesn't change inside one server
+// run, so spawning `which` + `<bin> --version` on every /api/agents request
+// (~400ms total for two agents) is wasted latency that blocks the studio
+// composer on first paint. TTL guards against the rare "user installed mid-
+// session" case.
+const DETECT_TTL_MS = 5 * 60 * 1000;
+let detectCache: { ts: number; result: DetectedAgent[] } | null = null;
+
+export async function detectAll(opts?: { force?: boolean }): Promise<DetectedAgent[]> {
+  const now = Date.now();
+  if (!opts?.force && detectCache && now - detectCache.ts < DETECT_TTL_MS) {
+    return detectCache.result;
+  }
+  const result = await Promise.all(AGENT_DEFS.map(detectOne));
+  detectCache = { ts: now, result };
+  return result;
 }

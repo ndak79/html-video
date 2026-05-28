@@ -32,10 +32,19 @@ const state = {
 
 // ============== boot ==============
 async function init() {
-  await Promise.all([refreshTemplates(), refreshAgents(), refreshProjects()]);
+  // Kick off agent detection in the background — `which` + `<bin> --version`
+  // can take ~400ms+ cold and there's no point holding the whole UI for it.
+  // Composer renders disabled-but-visible; we re-render it once agents land.
+  const agentsPromise = refreshAgents().then(() => {
+    renderToolbar();
+    if (state.selected) renderComposer();
+  });
+  await Promise.all([refreshTemplates(), refreshProjects()]);
   renderToolbar();
   wireToolbar();
   wireModals();
+  // Don't block — but surface failures in the console.
+  agentsPromise.catch((e) => console.warn('agent detection failed:', e));
 }
 async function refreshTemplates() {
   const r = await API.templates();
@@ -357,12 +366,18 @@ function renderComposer() {
   const sendBtn = document.getElementById('btn-send');
   if (!ta) return;
   const availableAgents = state.agents.filter(a => a.available);
+  const agentsKnown = state.agents.length > 0;
   // Composer is ready as soon as there's a project + an agent. Template is OPTIONAL
   // — agent can synthesize HTML from scratch from the user's prompt + attachments.
-  const ready = !!(p && availableAgents.length > 0);
-  ta.disabled = !ready || state.composing;
-  sendBtn.disabled = !ready || state.composing;
+  // While agent detection is still in flight (state.agents empty), allow typing
+  // optimistically so the user doesn't have to wait — the send button stays
+  // disabled until we confirm an agent is available.
+  const canType = !!p && !state.composing;
+  const canSend = !!(p && availableAgents.length > 0 && !state.composing);
+  ta.disabled = !canType;
+  sendBtn.disabled = !canSend;
   ta.placeholder = !p ? 'Pick a project first…'
+    : !agentsKnown ? 'Describe the video while we check for agents…'
     : availableAgents.length === 0 ? 'Install Claude Code (claude CLI) to enable chat…'
     : !p.templateId
       ? 'Describe a video — style, content, mood. Or pick a template above for a quick start.'
@@ -411,6 +426,34 @@ function renderChatLog() {
       // Fire as a new user turn
       pickAndSend(label);
     };
+  });
+  // Inline freeform input on each hv-options card
+  log.querySelectorAll('textarea[data-freeform-msg]').forEach((ta) => {
+    const msgIdx = Number(ta.dataset.freeformMsg);
+    const sendBtn = log.querySelector(`button.freeform-send[data-freeform-msg="${msgIdx}"]`);
+    const submit = () => {
+      const text = ta.value.trim();
+      if (!text) return;
+      const m = state.messages[msgIdx];
+      if (!m || m.pickedOption) return;
+      m.pickedOption = text;  // mark answered so options collapse
+      pickAndSend(text);
+    };
+    const autoResize = () => {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight + 2, 160) + 'px';
+    };
+    ta.addEventListener('input', () => {
+      if (sendBtn) sendBtn.disabled = ta.value.trim().length === 0;
+      autoResize();
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        submit();
+      }
+    });
+    if (sendBtn) sendBtn.onclick = submit;
   });
   log.scrollTop = log.scrollHeight;
 }
@@ -492,10 +535,18 @@ function renderOptionCard(opts, picked, msgIdx) {
       ${hint ? `<span class="hint">${esc(hint)}</span>` : ''}
     </button>`;
   }).join('');
+  // Inline freeform input — saves a trip to the bottom composer when the
+  // user just wants to type a custom answer to this card's question.
+  const freeformHtml = allowFreeform && !picked ? `
+    <div class="freeform-input">
+      <textarea data-freeform-msg="${msgIdx}" rows="1"
+        placeholder="…or type your own answer"></textarea>
+      <button class="freeform-send" data-freeform-msg="${msgIdx}" disabled>↵ Send</button>
+    </div>` : '';
   return `<div class="opt-card">
     <div class="question">${esc(opts.question)}</div>
     <div class="opts">${optsHtml}</div>
-    ${allowFreeform && !picked ? '<div class="freeform-hint">…or type your own answer below.</div>' : ''}
+    ${freeformHtml}
   </div>`;
 }
 
