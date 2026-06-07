@@ -296,6 +296,69 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         }
       }
 
+      // Enhance a data frame with a native Remotion template (user-initiated
+      // motion enhancement, RFC-08/09). Sets the frame's engine + renders a
+      // short single-frame preview MP4 so the studio can play the native
+      // animation before a full export. Streams SSE progress like export.
+      const enhMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/frames\/([^/]+)\/enhance$/);
+      if (enhMatch && enhMatch[1] && enhMatch[2] && m === 'POST') {
+        const projectId = enhMatch[1];
+        const nodeId = enhMatch[2];
+        const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+        const nativeTemplateId = (body.nativeTemplateId as string) || 'frame-data-rollup';
+        const wantsStream = (req.headers.accept ?? '').includes('text/event-stream');
+        if (!wantsStream) {
+          try {
+            await ctx.orchestrator.enhanceFrameNative(projectId, nodeId, nativeTemplateId);
+            const { project } = await ctx.orchestrator.renderFrameNativePreview({ projectId, graphNodeId: nodeId });
+            return json(res, 200, { ok: true, project, node_id: nodeId });
+          } catch (err) {
+            return json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        const sse = (obj: unknown) => {
+          try { if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`); }
+          catch { /* client gone — work keeps running, result is persisted */ }
+        };
+        const t0 = Date.now();
+        try {
+          sse({ type: 'enhance_started' });
+          sse({ type: 'enhance_progress', pct: 5, stage: 'preparing' });
+          await ctx.orchestrator.enhanceFrameNative(projectId, nodeId, nativeTemplateId);
+          const { project } = await ctx.orchestrator.renderFrameNativePreview({
+            projectId,
+            graphNodeId: nodeId,
+            onProgress: (pct, stage) => sse({ type: 'enhance_progress', pct, stage }),
+          });
+          const ms = Date.now() - t0;
+          process.stderr.write(`[studio:enhance] proj=${projectId} frame=${nodeId} done in ${ms}ms\n`);
+          sse({ type: 'enhance_done', project, node_id: nodeId, elapsed_ms: ms });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[studio:enhance] proj=${projectId} frame=${nodeId} failed: ${msg}\n`);
+          sse({ type: 'enhance_failed', message: msg });
+        }
+        res.end();
+        return;
+      }
+
+      // Revert a frame's native enhancement back to its base hyperframes HTML.
+      // Instant (no render) — the original HTML at frame.htmlPath is untouched.
+      const unenhMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/frames\/([^/]+)\/unenhance$/);
+      if (unenhMatch && unenhMatch[1] && unenhMatch[2] && m === 'POST') {
+        try {
+          const { project } = await ctx.orchestrator.unenhanceFrame(unenhMatch[1], unenhMatch[2]);
+          return json(res, 200, { ok: true, project, node_id: unenhMatch[2] });
+        } catch (err) {
+          return json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+
       // Export MP4 — streams progress via SSE so the user sees per-frame
       // recording status during a multi-minute multi-frame export.
       const expMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export$/);
@@ -1201,6 +1264,18 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const projId = previewServeMatch[1];
         const sub = previewServeMatch[2] ?? '/preview.html';
         const project = await ctx.orchestrator.load(projId);
+
+        // Phase C: serve an enhanced frame's preview MP4 (native Remotion frames
+        // have no HTML). Match the `.mp4` suffix BEFORE the plain HTML frame route.
+        const frameMp4Match = sub.match(/^\/frame\/([a-z0-9_-]+)\.mp4$/i);
+        if (frameMp4Match && frameMp4Match[1]) {
+          const frame = (project.frames ?? []).find((f) => f.graphNodeId === frameMp4Match[1]);
+          if (frame?.previewMp4Path && existsSync(frame.previewMp4Path)) {
+            return serveFile(frame.previewMp4Path, res);
+          }
+          res.writeHead(404);
+          return res.end('No preview MP4 for frame');
+        }
 
         // v0.8: serve a specific frame HTML by graph node id
         const frameMatch = sub.match(/^\/frame\/([a-z0-9_-]+)$/i);

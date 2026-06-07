@@ -579,8 +579,64 @@ export class ProjectOrchestrator {
     delete frame.engine;
     delete frame.nativeTemplateId;
     delete frame.data;
+    delete frame.previewMp4Path; // stop advertising a now-stale preview video
     await this.deps.projects.save(project);
     return { project, frame };
+  }
+
+  /**
+   * Render a single (enhanced) frame to a short MP4 for studio preview. A native
+   * frame has no HTML to show in the iframe strip, so the studio renders it on
+   * its own and plays the result as a <video>. Reuses {@link resolveFrameTemplateRef}
+   * — the same per-frame engine/template resolution exportMp4 uses — so the
+   * preview is pixel-identical to what the final export will stitch in.
+   *
+   * Writes to `frames/<order>.preview.mp4` (distinct from export's `frames/NN.mp4`
+   * so the two never overwrite each other). No soundtrack mux — a per-frame
+   * preview is silent and faster. Sets `frame.previewMp4Path` and saves (bumping
+   * `updatedAt`, which the studio uses as the <video> cache-bust token).
+   */
+  async renderFrameNativePreview(args: {
+    projectId: string;
+    graphNodeId: string;
+    onProgress?: (pct: number, stage: string) => void;
+    signal?: AbortSignal;
+  }): Promise<{ project: Project; frame: FrameRecord; previewPath: string }> {
+    const project = await this.deps.projects.load(args.projectId);
+    const projectDir = await this.deps.projects.ensureDir(project.id);
+    const frame = (project.frames ?? []).find((f) => f.graphNodeId === args.graphNodeId);
+    if (!frame) {
+      throw new HtmlVideoError('invalid-input', `Frame "${args.graphNodeId}" not found`);
+    }
+    const tmpl = project.templateId ? this.deps.templates.get(project.templateId) : null;
+    const projectEngine = tmpl?.engine ?? 'hyperframes';
+    const { engine, templateRef } = this.resolveFrameTemplateRef(frame, projectEngine);
+    const adapter = this.deps.engines.get(engine);
+
+    const previewPath = join(projectDir, 'frames', `${String(frame.order + 1).padStart(2, '0')}.preview.mp4`);
+    await adapter.render(
+      {
+        template: templateRef,
+        variables: frame.data !== undefined ? { ...project.variables, data: frame.data } : project.variables,
+        config: {
+          format: 'mp4',
+          resolution: project.preferences.resolution ?? { width: 1920, height: 1080 },
+          fps: project.preferences.fps ?? 60,
+          duration: frame.durationSec,
+          durationMode: 'explicit',
+          outputPath: previewPath,
+        },
+      },
+      {
+        workDir: projectDir,
+        ...(args.onProgress !== undefined && { onProgress: args.onProgress }),
+        ...(args.signal !== undefined && { signal: args.signal }),
+      },
+    );
+
+    frame.previewMp4Path = previewPath;
+    await this.deps.projects.save(project);
+    return { project, frame, previewPath };
   }
 
   /**

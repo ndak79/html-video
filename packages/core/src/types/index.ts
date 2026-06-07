@@ -359,6 +359,13 @@ export interface FrameRecord {
    * the frame so export is self-contained and doesn't re-read the graph.
    */
   data?: unknown;
+  /**
+   * When enhanced: path to a short single-frame MP4 the studio renders so the
+   * user can preview the native animation before a full export (a native frame
+   * has no HTML to load in an iframe). Cleared on unenhance. Separate from the
+   * export loop's `frames/NN.mp4` so the two lifecycles don't collide.
+   */
+  previewMp4Path?: string;
 }
 
 /**

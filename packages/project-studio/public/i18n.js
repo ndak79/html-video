@@ -82,6 +82,12 @@ const DICT = {
 
     'frames.label': 'Frames',
     'frames.view_graph': 'View graph',
+    'frames.enhance': '⚡ Enhance',
+    'frames.enhance_hint': 'Enhance this data frame with a native Remotion animation (numbers roll, bars grow)',
+    'frames.enhanced_revert': '⚡ Enhanced ✓ (revert)',
+    'frames.enhancing': '⚡ {pct}%…',
+    'enhance.done': '⚡ Frame enhanced with Remotion',
+    'enhance.failed': '⚡ Enhance failed: {message}',
 
     'text_pane.title': 'Frame text',
     'text_pane.no_project': 'No project.',
@@ -325,6 +331,12 @@ const DICT = {
 
     'frames.label': '分镜',
     'frames.view_graph': '看图谱',
+    'frames.enhance': '⚡ 增强',
+    'frames.enhance_hint': '用原生 Remotion 动画增强这个数据帧（数字滚动、柱子生长）',
+    'frames.enhanced_revert': '⚡ 已增强 ✓（还原）',
+    'frames.enhancing': '⚡ {pct}%…',
+    'enhance.done': '⚡ 该帧已用 Remotion 增强',
+    'enhance.failed': '⚡ 增强失败：{message}',
 
     'text_pane.title': '帧文字',
     'text_pane.no_project': '无项目。',
