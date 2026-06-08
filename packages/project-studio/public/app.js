@@ -48,6 +48,8 @@ const API = {
   getMessages: id => fetch(`/api/projects/${id}/messages`).then(r => r.json()),
   rawHtml: id => fetch(`/api/projects/${id}/raw-html`).then(r => r.ok ? r.text() : null),
   putRawHtml: (id, html) => fetch(`/api/projects/${id}/raw-html`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ html }) }).then(r => r.json()),
+  contentGraph: id => fetch(`/api/projects/${id}/content-graph`).then(r => r.ok ? r.json() : null),
+  unenhanceFrame: (id, nodeId) => fetch(`/api/projects/${id}/frames/${encodeURIComponent(nodeId)}/unenhance`, { method: 'POST' }).then(r => r.json()),
   testAgent: id => fetch(`/api/agents/${encodeURIComponent(id)}/test`, { method: 'POST' }).then(r => r.json()),
   rescanAgents: () => fetch('/api/agents?force=1').then(r => r.json()),
 };
@@ -70,6 +72,9 @@ const state = {
   exporting: false,        // export run in progress
   exportProgress: null,    // { pct, stage } during a streamed export
   lastGraph: null,         // last fetched ContentGraph (for download)
+  // Phase C: per-frame native Remotion enhancement
+  frameKinds: {},          // { [graphNodeId]: 'entity'|'data'|'text' } for the selected project
+  enhancing: null,         // { nodeId, pct, stage } while a single-frame enhance render is in flight
 };
 
 // ============== boot ==============
@@ -222,6 +227,89 @@ async function startExportStream() {
   }
 }
 
+// ============== Per-frame native enhancement (streamed) ==============
+// Render ONE data frame with the native Remotion template and stream progress,
+// mirroring startExportStream. On done, swap that frame's thumbnail + centre
+// preview to the rendered <video>. User-initiated only (the toggle's click).
+async function startEnhanceStream(nodeId, nativeTemplateId = 'frame-data-rollup') {
+  if (!state.selected || state.enhancing) return;
+  const projectId = state.selected.id;
+  state.enhancing = { nodeId, pct: 0, stage: 'starting' };
+  renderFramesStrip();
+
+  let res;
+  try {
+    res = await fetch(`/api/projects/${projectId}/frames/${encodeURIComponent(nodeId)}/enhance`, {
+      method: 'POST',
+      headers: { accept: 'text/event-stream', 'content-type': 'application/json' },
+      body: JSON.stringify({ nativeTemplateId }),
+    });
+  } catch (e) {
+    state.enhancing = null;
+    toast(t('enhance.failed', { message: (e?.message ?? e) }), 'error');
+    renderFramesStrip();
+    return;
+  }
+  if (!res.ok || !res.body) {
+    state.enhancing = null;
+    const err = await res.text().catch(() => '');
+    toast(t('enhance.failed', { message: err.slice(0, 200) }), 'error');
+    renderFramesStrip();
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const events = buf.split('\n\n');
+      buf = events.pop() ?? '';
+      for (const line of events) {
+        if (!line.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+        if (ev.type === 'enhance_progress') {
+          if (state.enhancing) { state.enhancing.pct = ev.pct; state.enhancing.stage = ev.stage; }
+          renderFramesStrip();
+        } else if (ev.type === 'enhance_done') {
+          state.enhancing = null;
+          if (ev.project) state.selected = ev.project; // bumped updatedAt → fresh <video> URL
+          state.messages.push({ role: 'preview-event', content: t('enhance.done'), ts: Date.now() });
+          renderChatLog();
+          renderFramesStrip();
+          renderPreview();
+          refreshProjects();
+        } else if (ev.type === 'enhance_failed') {
+          state.enhancing = null;
+          toast(t('enhance.failed', { message: ev.message }), 'error');
+          renderFramesStrip();
+        }
+      }
+    }
+  } catch (e) {
+    state.enhancing = null;
+    toast(t('enhance.failed', { message: (e?.message ?? e) }), 'error');
+    renderFramesStrip();
+  }
+}
+
+async function unenhanceFrameAction(nodeId) {
+  if (!state.selected || state.enhancing) return;
+  try {
+    const r = await API.unenhanceFrame(state.selected.id, nodeId);
+    if (r?.project) state.selected = r.project;
+    renderFramesStrip();
+    renderPreview();
+    refreshProjects();
+  } catch (e) {
+    toast(t('enhance.failed', { message: (e?.message ?? e) }), 'error');
+  }
+}
+
 /**
  * Detect "I want to export this to MP4" intent in a chat message.
  * Hits both Chinese + English without leaning on the agent.
@@ -267,6 +355,14 @@ async function selectProject(id) {
   state.activeFrameId = null;  // reset frame selection on project switch
   state.iterateFocusFrameId = null;
   state.editTextMode = false;
+  state.enhancing = null;
+  // Phase C: map graph node id → kind so the strip can show the "⚡ Enhance"
+  // toggle only on data frames. One fetch per project switch.
+  state.frameKinds = {};
+  try {
+    const cg = await API.contentGraph(id);
+    if (cg?.graph?.nodes) for (const n of cg.graph.nodes) state.frameKinds[n.id] = n.kind;
+  } catch { /* no graph (single-frame project) — no toggles, fine */ }
   // A generation running for the PREVIOUS project keeps going on the backend
   // (its result persists); just release the composer so this project is usable.
   // The in-flight SSE loop self-stops once it sees selectedId changed.
@@ -1816,6 +1912,20 @@ function renderPreview() {
   const sizeStyle = vh > vw
     ? 'width:auto;max-width:none;height:100%;max-height:100%'
     : 'width:100%;max-width:1280px';
+  // A native (enhanced) frame has no HTML — play its rendered preview MP4 and
+  // hide the data-hv-text edit affordance (there's no HTML text to edit).
+  const activeFrame = sortedFrames.find((f) => f.graphNodeId === state.activeFrameId);
+  const activeEnhanced = activeFrame?.engine === 'remotion';
+  if (activeEnhanced) {
+    const videoSrc = `/preview/${p.id}/frame/${encodeURIComponent(state.activeFrameId)}.mp4?t=${Date.now()}`;
+    stage.innerHTML = `<div class="preview-frame" style="aspect-ratio:${vw}/${vh};${sizeStyle}">
+      <video id="preview-iframe" src="${videoSrc}" autoplay muted loop controls playsinline style="width:${vw}px;height:${vh}px"></video>
+      ${stamp ? `<div class="stamp">${esc(stamp)} · ⚡</div>` : ''}
+    </div>`;
+    attachPreviewScaler();
+    renderFramesStrip();
+    return;
+  }
   // sandbox now grants same-origin so we can attach a text-edit overlay
   // from the parent window. allow-scripts keeps the page's own animations
   // running. forms / popups / top-navigation stay blocked.
@@ -2011,10 +2121,12 @@ function attachPreviewScaler() {
   const apply = () => {
     const w = frame.clientWidth;
     if (!w) return;
-    // Scale by the iframe's native design width (not a hardcoded 1920) so
-    // non-16:9 aspects (1080-wide) shrink correctly too.
-    const ifr = frame.querySelector('iframe');
-    const nativeW = ifr ? (parseFloat(ifr.style.width) || 1920) : 1920;
+    // Scale by the inner element's native design width (not a hardcoded 1920)
+    // so non-16:9 aspects (1080-wide) shrink correctly too. A native (enhanced)
+    // frame uses a <video> instead of an <iframe> — scale it the same way, else
+    // the 1920×1080 MP4 overflows and the frame gets cropped.
+    const inner = frame.querySelector('iframe, video');
+    const nativeW = inner ? (parseFloat(inner.style.width) || 1920) : 1920;
     frame.style.setProperty('--preview-scale', (w / nativeW).toFixed(4));
   };
   apply();
@@ -2058,10 +2170,29 @@ function renderFramesStrip() {
     const isFocus = f.graphNodeId === state.iterateFocusFrameId;
     const cls = ['frame-tab', isActive && 'active', isFocus && 'focus']
       .filter(Boolean).join(' ');
-    const src = `/preview/${p.id}/frame/${encodeURIComponent(f.graphNodeId)}?thumb=1&v=${ver}`;
-    return `<button class="${cls}" data-fid="${esc(f.graphNodeId)}">
+    // A native (enhanced) frame has no HTML — play its rendered preview MP4.
+    const enhanced = f.engine === 'remotion';
+    const thumbInner = enhanced
+      ? `<video src="/preview/${p.id}/frame/${encodeURIComponent(f.graphNodeId)}.mp4?v=${ver}" autoplay muted loop playsinline tabindex="-1"></video>`
+      : `<iframe sandbox="allow-scripts" src="/preview/${p.id}/frame/${encodeURIComponent(f.graphNodeId)}?thumb=1&v=${ver}" tabindex="-1" loading="lazy"></iframe>`;
+    // The "⚡ Enhance" control shows only on data frames (kind==='data'). It's an
+    // overlay badge ON the thumbnail (top area) so it's obvious + always visible.
+    const isData = state.frameKinds[f.graphNodeId] === 'data';
+    const busy = state.enhancing && state.enhancing.nodeId === f.graphNodeId;
+    let enhanceCtl = '';
+    if (isData) {
+      if (busy) {
+        enhanceCtl = `<span class="frame-enhance busy" data-fid="${esc(f.graphNodeId)}">${t('frames.enhancing', { pct: state.enhancing.pct ?? 0 })}</span>`;
+      } else if (enhanced) {
+        enhanceCtl = `<span class="frame-enhance on" data-fid="${esc(f.graphNodeId)}" data-act="unenhance" title="${esc(t('frames.enhanced_revert'))}">${t('frames.enhanced_revert')}</span>`;
+      } else {
+        enhanceCtl = `<span class="frame-enhance" data-fid="${esc(f.graphNodeId)}" data-act="enhance" title="${esc(t('frames.enhance_hint'))}">${t('frames.enhance')}</span>`;
+      }
+    }
+    return `<button class="${cls}${isData ? ' is-data' : ''}" data-fid="${esc(f.graphNodeId)}">
       <div class="frame-thumb">
-        <iframe sandbox="allow-scripts" src="${src}" tabindex="-1" loading="lazy"></iframe>
+        ${thumbInner}
+        ${enhanceCtl}
         ${isFocus ? '<div class="focus-mark" title="正在编辑此帧">✎</div>' : ''}
       </div>
       <div class="frame-tab-label">
@@ -2095,6 +2226,17 @@ function renderFramesStrip() {
       refreshTextFields();
       // Soundtrack narration is per-frame — point the textarea at this frame.
       if (typeof window.__hvSyncNarration === 'function') window.__hvSyncNarration();
+    });
+  });
+  // Per-frame enhance / revert toggle (data frames only). stopPropagation so
+  // clicking it doesn't also fire the parent tab's frame-switch handler.
+  strip.querySelectorAll('.frame-enhance').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (state.enhancing) return; // single in-flight; ignore double-clicks
+      const fid = el.dataset.fid;
+      if (el.dataset.act === 'unenhance') unenhanceFrameAction(fid);
+      else if (el.dataset.act === 'enhance') startEnhanceStream(fid);
     });
   });
   const gbtn = document.getElementById('btn-show-graph');
@@ -2432,6 +2574,16 @@ async function sendMessage() {
             if (frameCount > 0) state.activeFrameId = null;
             const pr = await API.getProject(state.selected.id);
             state.selected = pr.project;
+            // Generating in-place writes a fresh content-graph, so the node→kind
+            // map must be rebuilt — otherwise data frames don't get their ⚡
+            // Remotion badge until the user switches projects and back.
+            if (frameCount > 0) {
+              state.frameKinds = {};
+              try {
+                const cg = await API.contentGraph(state.selected.id);
+                if (cg?.graph?.nodes) for (const n of cg.graph.nodes) state.frameKinds[n.id] = n.kind;
+              } catch { /* no graph — single-frame, fine */ }
+            }
             renderPreview(); // also re-syncs soundtrack buttons via __hvSyncNarration
             await refreshTextFields();
             renderToolbar();

@@ -296,6 +296,69 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         }
       }
 
+      // Enhance a data frame with a native Remotion template (user-initiated
+      // motion enhancement, RFC-08/09). Sets the frame's engine + renders a
+      // short single-frame preview MP4 so the studio can play the native
+      // animation before a full export. Streams SSE progress like export.
+      const enhMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/frames\/([^/]+)\/enhance$/);
+      if (enhMatch && enhMatch[1] && enhMatch[2] && m === 'POST') {
+        const projectId = enhMatch[1];
+        const nodeId = enhMatch[2];
+        const body = await readBody(req).catch(() => ({} as Record<string, unknown>));
+        const nativeTemplateId = (body.nativeTemplateId as string) || 'frame-data-rollup';
+        const wantsStream = (req.headers.accept ?? '').includes('text/event-stream');
+        if (!wantsStream) {
+          try {
+            await ctx.orchestrator.enhanceFrameNative(projectId, nodeId, nativeTemplateId);
+            const { project } = await ctx.orchestrator.renderFrameNativePreview({ projectId, graphNodeId: nodeId });
+            return json(res, 200, { ok: true, project, node_id: nodeId });
+          } catch (err) {
+            return json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        const sse = (obj: unknown) => {
+          try { if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`); }
+          catch { /* client gone — work keeps running, result is persisted */ }
+        };
+        const t0 = Date.now();
+        try {
+          sse({ type: 'enhance_started' });
+          sse({ type: 'enhance_progress', pct: 5, stage: 'preparing' });
+          await ctx.orchestrator.enhanceFrameNative(projectId, nodeId, nativeTemplateId);
+          const { project } = await ctx.orchestrator.renderFrameNativePreview({
+            projectId,
+            graphNodeId: nodeId,
+            onProgress: (pct, stage) => sse({ type: 'enhance_progress', pct, stage }),
+          });
+          const ms = Date.now() - t0;
+          process.stderr.write(`[studio:enhance] proj=${projectId} frame=${nodeId} done in ${ms}ms\n`);
+          sse({ type: 'enhance_done', project, node_id: nodeId, elapsed_ms: ms });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[studio:enhance] proj=${projectId} frame=${nodeId} failed: ${msg}\n`);
+          sse({ type: 'enhance_failed', message: msg });
+        }
+        res.end();
+        return;
+      }
+
+      // Revert a frame's native enhancement back to its base hyperframes HTML.
+      // Instant (no render) — the original HTML at frame.htmlPath is untouched.
+      const unenhMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/frames\/([^/]+)\/unenhance$/);
+      if (unenhMatch && unenhMatch[1] && unenhMatch[2] && m === 'POST') {
+        try {
+          const { project } = await ctx.orchestrator.unenhanceFrame(unenhMatch[1], unenhMatch[2]);
+          return json(res, 200, { ok: true, project, node_id: unenhMatch[2] });
+        } catch (err) {
+          return json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+
       // Export MP4 — streams progress via SSE so the user sees per-frame
       // recording status during a multi-minute multi-frame export.
       const expMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/export$/);
@@ -1201,6 +1264,18 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const projId = previewServeMatch[1];
         const sub = previewServeMatch[2] ?? '/preview.html';
         const project = await ctx.orchestrator.load(projId);
+
+        // Phase C: serve an enhanced frame's preview MP4 (native Remotion frames
+        // have no HTML). Match the `.mp4` suffix BEFORE the plain HTML frame route.
+        const frameMp4Match = sub.match(/^\/frame\/([a-z0-9_-]+)\.mp4$/i);
+        if (frameMp4Match && frameMp4Match[1]) {
+          const frame = (project.frames ?? []).find((f) => f.graphNodeId === frameMp4Match[1]);
+          if (frame?.previewMp4Path && existsSync(frame.previewMp4Path)) {
+            return serveFile(frame.previewMp4Path, res);
+          }
+          res.writeHead(404);
+          return res.end('No preview MP4 for frame');
+        }
 
         // v0.8: serve a specific frame HTML by graph node id
         const frameMatch = sub.match(/^\/frame\/([a-z0-9_-]+)$/i);
@@ -2557,6 +2632,18 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
                 default: defaults.frame_count,
                 options: ['2', '3', '4', '5', '6', '7', '8', '9', '10'].map((v) => ({ value: v, label: v })),
               },
+              // Opt-in: render data frames natively with Remotion (numbers roll,
+              // bars grow) instead of static hyperframes HTML. Default OFF —
+              // Remotion is a user-chosen enhancement, the AI never flips it.
+              {
+                key: 'remotion_enhance', label: '⚡ 数据帧用 Remotion', kind: 'buttons', required: false,
+                default: '关',
+                hint: '数据帧用原生 Remotion 渲染（数字滚动 / 柱子生长）；其余帧仍走 Hyperframes',
+                options: [
+                  { value: '关', label: '关' },
+                  { value: '开', label: '开 · Remotion' },
+                ],
+              },
             ]
           : [
               {
@@ -3024,6 +3111,10 @@ async function runSplitMultiFrameGenerate(
   }
   const aspect = ((collected.aspect ?? '16:9').split(/\s+/)[0] ?? '16:9');
   const frameCountReq = Math.max(2, Math.min(10, Number(collected.frame_count ?? '4') || 4));
+  // Opt-in (format card): render data frames natively with Remotion. When on,
+  // the planner must give every data node structured items, and after each
+  // data frame's HTML is written we enhance it in place (best-effort).
+  const enhanceData = (collected.remotion_enhance ?? '').startsWith('开');
   // Prefer per-frame pacing (total = per_frame × frames) — set by the format
   // card so a short total ÷ many frames can't produce a rushed clip. Fall back
   // to total ÷ frames for older projects that only stored `duration`.
@@ -3111,12 +3202,30 @@ async function runSplitMultiFrameGenerate(
     schemaVersion: 1,
     intent: 'explainer',
     synopsis: '<one-line description of the video>',
-    nodes: Array.from({ length: frameCountReq }, (_, i) => ({
-      id: `frame_${i + 1}`,
-      kind: i === 0 ? 'text' : i === frameCountReq - 1 ? 'entity' : 'data',
-      durationSec: perFrameDurationSec,
-      text: '<headline / subtitle for this frame>',
-    })),
+    nodes: Array.from({ length: frameCountReq }, (_, i) => {
+      const kind = i === 0 ? 'text' : i === frameCountReq - 1 ? 'entity' : 'data';
+      const node: Record<string, unknown> = {
+        id: `frame_${i + 1}`,
+        kind,
+        durationSec: perFrameDurationSec,
+        text: '<headline / subtitle for this frame>',
+      };
+      // Every data node carries structured items so it can be rendered natively
+      // with Remotion (numbers roll, bars grow) — whether the user opted in now
+      // or enhances the frame later from the strip. A data frame without numbers
+      // is just a text frame.
+      if (kind === 'data') {
+        node.data = {
+          title: '<short chart title>',
+          unit: '<optional unit, e.g. K / % / ★>',
+          items: [
+            { label: '<label>', value: 0 },
+            { label: '<label>', value: 0 },
+          ],
+        };
+      }
+      return node;
+    }),
     edges: Array.from({ length: frameCountReq - 1 }, (_, i) => ({
       from: `frame_${i + 1}`,
       to: `frame_${i + 2}`,
@@ -3126,6 +3235,8 @@ async function runSplitMultiFrameGenerate(
   graphPromptParts.push('```');
   graphPromptParts.push('');
   graphPromptParts.push(`Replace the placeholder text in each node with concrete content from the inputs. Adjust intent to match (single-frame|explainer|data-viz|promo|comparison|other). Keep node ids unique. Do NOT return an empty reply. Do NOT emit any HTML this turn.`);
+  graphPromptParts.push(`DATA FRAMES: every \`kind:"data"\` node MUST carry a \`data\` object \`{ title?, unit?, items: [{ label, value }] }\` with at least 2 items and numeric \`value\`s drawn from the inputs/source — real figures, not placeholders (they can be animated with rolling counters / growing bars). The node's \`text\` still holds the headline. If a frame genuinely has no quantitative data, make it a \`text\` node instead of \`data\`.`);
+  graphPromptParts.push(`DATA FRAME QUALITY: (1) Items in ONE data frame must be COMPARABLE — the same unit and a similar order of magnitude. Do NOT mix wildly different scales in one chart (e.g. 61,000 GitHub stars next to 142 plugins) — one giant bar makes the rest invisible. If figures have different units or scales, split them across separate data frames, or pick the 2-4 that genuinely compare. (2) \`unit\` is OPTIONAL and only for a real shared unit (e.g. "%", "K", "★", "ms"). If the numbers are plain counts with no meaningful unit, OMIT \`unit\` entirely — never use filler like "count" / "个" / "次".`);
   graphPromptParts.push(`STRICT JSON: the block must be valid JSON. Inside string values do NOT use straight double-quotes ("…") — if you need to quote a term or title, use 「」 or 《》 or single quotes. No trailing commas. No comments.`);
 
   const graphPrompt = graphPromptParts.join('\n');
@@ -3244,6 +3355,30 @@ h1{font-size:8vw;letter-spacing:-.03em;animation:in 1s ease forwards;opacity:0;t
       throw new Error(`frame "${nodeId}" generation returned empty (${frameText.length}B)`);
     }
     await ctx.orchestrator.writeFrameHtml(projectId, nodeId, extracted);
+    // Native Remotion enhancement (opt-in via format card). The frame now has a
+    // FrameRecord, so enhanceFrameNative can set engine/nativeTemplateId/data in
+    // place. Best-effort: if the data node lacks usable {label,value} items it
+    // throws — we keep the hyperframes HTML and warn rather than fail the run.
+    // 'frame-data-rollup' is the only native template today (TODO: picker).
+    if (enhanceData && node.kind === 'data') {
+      try {
+        // Two steps, same as the manual enhance endpoint: (1) set the frame's
+        // engine/data, (2) actually RENDER the preview MP4. Without step 2 the
+        // frame is flagged remotion but has no previewMp4Path, so the studio
+        // tries to play a <video> that 404s → black thumbnail + preview.
+        await ctx.orchestrator.enhanceFrameNative(projectId, nodeId, 'frame-data-rollup');
+        onProgress(`  ⚡ 第 ${i + 1} 帧渲染 Remotion 动效 (数字滚动 / 柱子生长)…`);
+        await ctx.orchestrator.renderFrameNativePreview({ projectId, graphNodeId: nodeId });
+        onSse({ type: 'frame_enhanced', node_id: nodeId, order: i });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`[studio:split-generate] proj=${projectId} frame=${nodeId} enhance skipped: ${msg}\n`);
+        onProgress(`  ⚠️ 第 ${i + 1} 帧无法用 Remotion 增强（回落静态 HTML）：${msg}`);
+        // Revert the engine flag so the frame falls back to its hyperframes HTML
+        // (the <iframe> path) instead of showing a broken <video>.
+        try { await ctx.orchestrator.unenhanceFrame(projectId, nodeId); } catch { /* ignore */ }
+      }
+    }
     onProgress(`  ✓ 第 ${i + 1}/${graph.nodes.length} 帧完成 (${nodeId})`);
     onSse({ type: 'frame_done', node_id: nodeId, order: i, total: graph.nodes.length });
   }
